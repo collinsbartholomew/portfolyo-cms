@@ -1,0 +1,639 @@
+import dbConnect from '@/lib/db';
+import Cron from '@/models/Cron';
+import CronLog from '@/models/CronLog';
+import { executeUnreferencedCleanup, executeWebPMigration } from '@/lib/storageAudit';
+import { sendNotification } from './notificationService';
+
+// Dynamic variables query models
+import Blog from '@/models/Blog';
+import Project from '@/models/Project';
+import Gallery from '@/models/Gallery';
+import Config from '@/models/Config';
+import About from '@/models/About';
+import Ads from '@/models/Ads';
+import Social from '@/models/Social';
+import Theme from '@/models/Theme';
+import ContactMessage from '@/models/ContactMessage';
+import Deployment from '@/models/Deployment';
+import { decrypt } from '@/lib/encryption';
+
+function parseCronField(field, min, max) {
+    if (field === '*') return Array.from({ length: max - min + 1 }, (_, i) => min + i);
+    
+    const parts = field.split(',');
+    const values = [];
+    
+    for (const part of parts) {
+        if (part.includes('/')) {
+            const [range, stepStr] = part.split('/');
+            const step = parseInt(stepStr, 10);
+            let start = min;
+            let end = max;
+            if (range !== '*') {
+                if (range.includes('-')) {
+                    const [s, e] = range.split('-');
+                    start = parseInt(s, 10);
+                    end = parseInt(e, 10);
+                } else {
+                    start = parseInt(range, 10);
+                }
+            }
+            for (let i = start; i <= end; i += step) {
+                values.push(i);
+            }
+        } else if (part.includes('-')) {
+            const [s, e] = part.split('-');
+            const start = parseInt(s, 10);
+            const end = parseInt(e, 10);
+            for (let i = start; i <= end; i++) {
+                values.push(i);
+            }
+        } else {
+            values.push(parseInt(part, 10));
+        }
+    }
+    return Array.from(new Set(values));
+}
+
+export function getDateTimeParts(date, timeZone) {
+    try {
+        const parts = new Intl.DateTimeFormat('en-US', {
+            timeZone,
+            year: 'numeric',
+            month: 'numeric',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: 'numeric',
+            second: 'numeric',
+            weekday: 'short',
+            hour12: false
+        }).formatToParts(date);
+
+        const map = {};
+        for (const p of parts) {
+            map[p.type] = p.value;
+        }
+
+        const weekdayMap = {
+            'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6
+        };
+
+        return {
+            minute: parseInt(map.minute, 10),
+            hour: parseInt(map.hour, 10) % 24,
+            day: parseInt(map.day, 10),
+            month: parseInt(map.month, 10),
+            weekday: weekdayMap[map.weekday] ?? date.getDay()
+        };
+    } catch (e) {
+        return {
+            minute: date.getMinutes(),
+            hour: date.getHours(),
+            day: date.getDate(),
+            month: date.getMonth() + 1,
+            weekday: date.getDay()
+        };
+    }
+}
+
+export function isCronDue(cronExpression, date = new Date(), timeZone) {
+    const fields = cronExpression.trim().split(/\s+/);
+    if (fields.length !== 5) return false;
+    
+    const [minExp, hourExp, domExp, monthExp, dowExp] = fields;
+    
+    const minutes = parseCronField(minExp, 0, 59);
+    const hours = parseCronField(hourExp, 0, 23);
+    const doms = parseCronField(domExp, 1, 31);
+    const months = parseCronField(monthExp, 1, 12);
+    const dows = parseCronField(dowExp, 0, 6).map(v => v === 7 ? 0 : v);
+    
+    let currentMin, currentHour, currentDom, currentMonth, currentDow;
+    
+    if (timeZone) {
+        const parts = getDateTimeParts(date, timeZone);
+        currentMin = parts.minute;
+        currentHour = parts.hour;
+        currentDom = parts.day;
+        currentMonth = parts.month;
+        currentDow = parts.weekday;
+    } else {
+        currentMin = date.getMinutes();
+        currentHour = date.getHours();
+        currentDom = date.getDate();
+        currentMonth = date.getMonth() + 1;
+        currentDow = date.getDay();
+    }
+    
+    return minutes.includes(currentMin) &&
+           hours.includes(currentHour) &&
+           doms.includes(currentDom) &&
+           months.includes(currentMonth) &&
+           dows.includes(currentDow);
+}
+
+export function getNextCronRun(cronExpression, startDate = new Date(), timeZone) {
+    const checkDate = new Date(startDate.getTime());
+    checkDate.setSeconds(0, 0);
+    
+    for (let i = 0; i < 14400; i++) { // Max 10 days
+        checkDate.setMinutes(checkDate.getMinutes() + 1);
+        if (isCronDue(cronExpression, checkDate, timeZone)) {
+            return checkDate;
+        }
+    }
+    return null;
+}
+
+export async function initCronRunner() {
+    if (global.cronIntervalStarted) return;
+    global.cronIntervalStarted = true;
+
+    console.log('[CRON SERVICE] Initializing task scheduler...');
+    await dbConnect();
+
+    // Fetch global default timezone
+    let timeZone = 'UTC';
+    try {
+        const config = await Config.findOne().lean();
+        if (config && config.defaultTimezone) {
+            timeZone = config.defaultTimezone;
+        }
+    } catch (configErr) {
+        console.error('[CRON SERVICE] Failed to load global timezone config:', configErr);
+    }
+
+    // Seed system cron jobs
+    try {
+        const cleanupJob = await Cron.findOne({ action: 'clean_unreferenced' });
+        if (!cleanupJob) {
+            await Cron.create({
+                name: 'Unreferenced Uploads Cleanup',
+                type: 'system',
+                schedule: '0 2 * * *', // Daily at 2:00 AM
+                enabled: true,
+                action: 'clean_unreferenced',
+                nextRun: getNextCronRun('0 2 * * *', new Date(), timeZone)
+            });
+            console.log('[CRON SERVICE] Seeded: Unreferenced Uploads Cleanup');
+        }
+
+        const webpJob = await Cron.findOne({ action: 'migrate_webp' });
+        if (!webpJob) {
+            await Cron.create({
+                name: 'WebP Image Migration',
+                type: 'system',
+                schedule: '0 3 * * *', // Daily at 3:00 AM
+                enabled: true,
+                action: 'migrate_webp',
+                nextRun: getNextCronRun('0 3 * * *', new Date(), timeZone)
+            });
+            console.log('[CRON SERVICE] Seeded: WebP Image Migration');
+        }
+
+        // Self-heal and recalculate missing or outdated nextRun timestamps
+        const now = new Date();
+        const jobsToHeal = await Cron.find({
+            enabled: true,
+            $or: [
+                { nextRun: null },
+                { nextRun: { $exists: false } },
+                { nextRun: { $lt: now } }
+            ]
+        });
+        for (const job of jobsToHeal) {
+            job.nextRun = getNextCronRun(job.schedule, now, timeZone);
+            await job.save();
+            console.log(`[CRON SERVICE] Self-healed nextRun for task: ${job.name} -> ${job.nextRun}`);
+        }
+    } catch (err) {
+        console.error('[CRON SERVICE] Failed to seed or self-heal system jobs:', err);
+    }
+
+    // Run due cron jobs check immediately on start, then every 60s
+    setTimeout(() => runDueCronJobs(), 5000); // Wait 5s on boot
+
+    setInterval(async () => {
+        await runDueCronJobs();
+    }, 60000);
+}
+
+async function runDueCronJobs() {
+    try {
+        await dbConnect();
+        const activeJobs = await Cron.find({ enabled: true });
+        const now = new Date();
+
+        let timeZone = 'UTC';
+        try {
+            const config = await Config.findOne().lean();
+            if (config && config.defaultTimezone) {
+                timeZone = config.defaultTimezone;
+            }
+        } catch (configErr) {
+            console.error('[CRON SERVICE] Failed to load global timezone config in run loop:', configErr);
+        }
+
+        for (const job of activeJobs) {
+            if (isCronDue(job.schedule, now, timeZone)) {
+                console.log(`[CRON SERVICE] Triggering job: ${job.name}`);
+                executeCronJob(job).catch(err => {
+                    console.error(`[CRON SERVICE] Failed executing job ${job.name}:`, err);
+                });
+            }
+        }
+    } catch (err) {
+        console.error('[CRON SERVICE] Error in task scheduler loop:', err);
+    }
+}
+
+function getValueByPath(obj, path) {
+    if (!path) return obj;
+    const cleanPath = path
+        .replace(/\[['"]?([^'"\]]+)['"]?\]/g, '.$1')
+        .replace(/^\./, '');
+    
+    const parts = cleanPath.split('.');
+    let current = obj;
+    for (const part of parts) {
+        if (current === null || current === undefined) return undefined;
+        current = current[part];
+    }
+    return current;
+}
+
+async function resolvePlaceholder(modelName, path, cachedData) {
+    const lowerModel = modelName.toLowerCase();
+    
+    if (lowerModel === 'time' || lowerModel === 'timestamp') {
+        return new Date().toISOString();
+    }
+    if (lowerModel === 'date') {
+        return new Date().toLocaleDateString();
+    }
+    if (lowerModel === 'env') {
+        return getValueByPath(cachedData.env || {}, path);
+    }
+    if (lowerModel === 'site') {
+        const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || process.env.SITE_URL || 'http://localhost:3000';
+        return getValueByPath({ url: siteUrl }, path) || siteUrl;
+    }
+    if (lowerModel === 'device') {
+        let osInfo = 'unknown';
+        let arch = 'unknown';
+        let nodeVersion = process.version;
+        let platform = process.platform;
+        try {
+            const os = await import('os');
+            osInfo = `${os.type()} ${os.release()}`;
+            arch = os.arch();
+        } catch (e) {
+            // Ignore dynamic OS import errors
+        }
+
+        const deviceInfo = {
+            platform,
+            os: osInfo,
+            arch,
+            nodeVersion,
+            environment: process.env.NODE_ENV || 'development'
+        };
+
+        return getValueByPath(deviceInfo, path) ?? deviceInfo;
+    }
+
+    const modelMapping = {
+        blogs: { model: Blog, query: () => Blog.find({}).sort({ createdAt: -1 }).lean() },
+        blog: { model: Blog, query: () => Blog.find({}).sort({ createdAt: -1 }).lean() },
+        projects: { model: Project, query: () => Project.find({}).sort({ order: 1 }).lean() },
+        project: { model: Project, query: () => Project.find({}).sort({ order: 1 }).lean() },
+        gallery: { model: Gallery, query: () => Gallery.find({}).sort({ order: 1 }).lean() },
+        config: { model: Config, query: () => Config.findOne({}).lean() },
+        about: { model: About, query: () => About.findOne({}).lean() },
+        ads: { model: Ads, query: () => Ads.findOne({}).lean() },
+        socials: { model: Social, query: () => Social.find({}).lean() },
+        social: { model: Social, query: () => Social.find({}).lean() },
+        theme: { model: Theme, query: () => Theme.findOne({}).lean() },
+        themes: { model: Theme, query: () => Theme.findOne({}).lean() },
+        messages: { model: ContactMessage, query: () => ContactMessage.find({}).sort({ createdAt: -1 }).lean() },
+        message: { model: ContactMessage, query: () => ContactMessage.find({}).sort({ createdAt: -1 }).lean() },
+        deployments: { model: Deployment, query: () => Deployment.find({}).sort({ order: 1 }).lean() },
+        deployment: { model: Deployment, query: () => Deployment.find({}).sort({ order: 1 }).lean() },
+        crons: { model: Cron, query: () => Cron.find({}).lean() },
+        cron: { model: Cron, query: () => Cron.find({}).lean() }
+    };
+
+    if (modelMapping[lowerModel]) {
+        if (!cachedData[lowerModel]) {
+            try {
+                await dbConnect();
+                cachedData[lowerModel] = await modelMapping[lowerModel].query();
+            } catch (err) {
+                console.error(`[CRON TEMPLATE ERROR] Failed to fetch model data for ${lowerModel}:`, err);
+                cachedData[lowerModel] = null;
+            }
+        }
+        return getValueByPath(cachedData[lowerModel], path);
+    }
+
+    return `$${modelName}${path}`;
+}
+
+export async function compileTemplate(templateStr, cachedData) {
+    if (typeof templateStr !== 'string') return templateStr;
+    if (!templateStr.includes('$')) return templateStr;
+
+    const singlePlaceholderMatch = templateStr.match(/^\$([a-zA-Z0-9_]+)([\.\[\]'"\-a-zA-Z0-9_]*)$/);
+    if (singlePlaceholderMatch) {
+        return resolvePlaceholder(singlePlaceholderMatch[1], singlePlaceholderMatch[2], cachedData);
+    }
+
+    const regex = /\$([a-zA-Z0-9_]+)([\.\[\]'"\-a-zA-Z0-9_]*)/g;
+    let match;
+    let result = templateStr;
+    const matches = [];
+    while ((match = regex.exec(templateStr)) !== null) {
+        matches.push({
+            full: match[0],
+            model: match[1],
+            path: match[2],
+            index: match.index
+        });
+    }
+
+    for (let i = matches.length - 1; i >= 0; i--) {
+        const m = matches[i];
+        const val = await resolvePlaceholder(m.model, m.path, cachedData);
+        const replacement = typeof val === 'object' ? JSON.stringify(val) : String(val ?? '');
+        result = result.slice(0, m.index) + replacement + result.slice(m.index + m.full.length);
+    }
+
+    return result;
+}
+
+export async function compileTemplateObject(obj, cachedData) {
+    if (obj === null || obj === undefined) return obj;
+    if (typeof obj === 'string') {
+        return compileTemplate(obj, cachedData);
+    }
+    if (Array.isArray(obj)) {
+        const compiledArray = [];
+        for (const item of obj) {
+            compiledArray.push(await compileTemplateObject(item, cachedData));
+        }
+        return compiledArray;
+    }
+    if (typeof obj === 'object') {
+        const compiledObj = {};
+        for (const key of Object.keys(obj)) {
+            compiledObj[key] = await compileTemplateObject(obj[key], cachedData);
+        }
+        return compiledObj;
+    }
+    return obj;
+}
+
+function hasTemplateValue(value) {
+    return typeof value === 'string' && value.includes('$');
+}
+
+function valueToRequestString(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'object') {
+        if (typeof value.url === 'string') return value.url;
+        return JSON.stringify(value);
+    }
+    return String(value);
+}
+
+function redactEnvSecrets(value, env = {}) {
+    let output = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+
+    for (const [key, secret] of Object.entries(env)) {
+        if (!secret) continue;
+        output = output.split(String(secret)).join(`[SECRET: ${key}]`);
+    }
+
+    return output;
+}
+
+function safeLogJson(value, env = {}) {
+    return redactEnvSecrets(JSON.stringify(value, null, 2), env);
+}
+
+export async function executeCronJob(job) {
+    const startTime = Date.now();
+    let status = 'success';
+    let logOutput = '';
+    let requestMethod = '';
+    let requestUrl = '';
+    let requestUrlForLog = '';
+
+    const maxAttempts = job.retryEnabled ? (job.retryCount ?? 3) + 1 : 1;
+    const baseDelay = job.retryDelay ?? 60;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const attemptStartTime = Date.now();
+        let attemptStatus = 'success';
+        let attemptLogOutput = '';
+
+        try {
+            if (job.action === 'clean_unreferenced') {
+                const auditResult = await executeUnreferencedCleanup();
+                attemptLogOutput = `Cleanup completed in ${Date.now() - attemptStartTime}ms.\n` +
+                            `Deleted ${auditResult.deletedCount} files, reclaiming ${auditResult.reclaimedString}.\n` +
+                            `Skipped files: ${auditResult.skippedCount}.`;
+            } else if (job.action === 'migrate_webp') {
+                const migrationResult = await executeWebPMigration();
+                attemptLogOutput = `WebP migration completed in ${Date.now() - attemptStartTime}ms.\n` +
+                            `Migrated: ${migrationResult.migratedCount} images.\n` +
+                            `Space saved: ${migrationResult.reclaimedString}.\n` +
+                            `Details: ${JSON.stringify(migrationResult.details, null, 2)}`;
+            } else if (job.action === 'webhook') {
+                const cachedData = {};
+                cachedData.env = {};
+                
+                // Load global environment variables
+                try {
+                    const CronEnv = (await import('@/models/CronEnv')).default;
+                    const globalEnvDoc = await CronEnv.findOne({}).lean();
+                    if (globalEnvDoc && Array.isArray(globalEnvDoc.env)) {
+                        for (const env of globalEnvDoc.env) {
+                            if (env.key && env.key.trim()) {
+                                cachedData.env[env.key.trim()] = env.value ? decrypt(env.value) : '';
+                            }
+                        }
+                    }
+                } catch (envErr) {
+                    console.error('[CRON SERVICE] Failed to load global environment variables:', envErr);
+                }
+
+                const shouldCompileUrl = job.webhookUrlType === 'expression' || hasTemplateValue(job.webhookUrl);
+                const compiledUrlValue = shouldCompileUrl
+                    ? await compileTemplate(job.webhookUrl, cachedData)
+                    : job.webhookUrl;
+                const compiledUrl = valueToRequestString(compiledUrlValue);
+                const method = job.webhookMethod || 'POST';
+                requestMethod = method;
+                requestUrl = compiledUrl;
+                requestUrlForLog = redactEnvSecrets(compiledUrl, cachedData.env);
+
+                const rawHeaders = {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Portfolyo CMS-Task-Scheduler'
+                };
+
+                if (job.webhookHeaders && Array.isArray(job.webhookHeaders)) {
+                    for (const header of job.webhookHeaders) {
+                        if (header.key && header.key.trim()) {
+                            const headerKey = job.webhookHeadersType === 'expression' || hasTemplateValue(header.key)
+                                ? valueToRequestString(await compileTemplate(header.key.trim(), cachedData)).trim()
+                                : header.key.trim();
+
+                            if (!headerKey) continue;
+
+                            const normalKey = Object.keys(rawHeaders).find(
+                                k => k.toLowerCase() === headerKey.toLowerCase()
+                            ) || headerKey;
+
+                            rawHeaders[normalKey] = job.webhookHeadersType === 'expression' || hasTemplateValue(header.value)
+                                ? valueToRequestString(await compileTemplate(header.value || '', cachedData))
+                                : header.value || '';
+                        }
+                    }
+                }
+                const headers = Object.fromEntries(
+                    Object.entries(rawHeaders).map(([key, value]) => [key, valueToRequestString(value)])
+                );
+
+                let bodyContent = undefined;
+                if (method === 'POST') {
+                    if (job.webhookBody !== undefined && job.webhookBody !== null && job.webhookBody.trim() !== '') {
+                        if (job.webhookBodyType === 'fixed' && !hasTemplateValue(job.webhookBody)) {
+                            bodyContent = job.webhookBody.trim();
+                        } else {
+                            const compiledBody = await compileTemplate(job.webhookBody.trim(), cachedData);
+                            bodyContent = typeof compiledBody === 'object' ? JSON.stringify(compiledBody) : String(compiledBody);
+                            
+                            if (typeof compiledBody === 'object' && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+                                headers['Content-Type'] = 'application/json';
+                            }
+                        }
+                    } else {
+                        bodyContent = JSON.stringify({
+                            cronName: job.name,
+                            triggeredAt: new Date().toISOString()
+                        });
+                    }
+                }
+
+                const requestLog = [
+                    `Request Method: ${method}`,
+                    `Request URL: ${redactEnvSecrets(compiledUrl, cachedData.env)}`,
+                    shouldCompileUrl ? `Raw URL Template: ${redactEnvSecrets(job.webhookUrl, cachedData.env)}` : null,
+                    `Request Headers:\n${safeLogJson(headers, cachedData.env)}`,
+                    method === 'POST'
+                        ? `Request Body:\n${redactEnvSecrets(bodyContent || '', cachedData.env)}`
+                        : null
+                ].filter(Boolean).join('\n\n');
+
+                const res = await fetch(compiledUrl, {
+                    method,
+                    headers,
+                    body: bodyContent
+                });
+                const text = await res.text();
+                attemptLogOutput = `${requestLog}\n\nWebhook trigger returned HTTP status ${res.status}.\nResponse:\n${text}`;
+                if (!res.ok) {
+                    attemptStatus = 'failure';
+                }
+            } else {
+                throw new Error(`Unknown action: ${job.action}`);
+            }
+        } catch (err) {
+            attemptStatus = 'failure';
+            attemptLogOutput = `Execution failed after ${Date.now() - attemptStartTime}ms.\nError: ${err.message}\nStack: ${err.stack}`;
+        }
+
+        // Add to main logOutput
+        if (maxAttempts > 1) {
+            logOutput += `--- Attempt ${attempt} of ${maxAttempts} ---\n${attemptLogOutput}\n\n`;
+        } else {
+            logOutput = attemptLogOutput;
+        }
+
+        status = attemptStatus;
+
+        if (status === 'success') {
+            break;
+        }
+
+        if (attempt < maxAttempts) {
+            let nextDelay = baseDelay;
+            if (job.retryType === 'exponential') {
+                nextDelay = baseDelay * Math.pow(2, attempt - 1);
+            }
+            logOutput += `[Attempt ${attempt} failed. Retrying in ${nextDelay}s (${job.retryType} delay)...]\n\n`;
+            await new Promise(resolve => setTimeout(resolve, nextDelay * 1000));
+        }
+    }
+
+    // Update Cron document
+    try {
+        const ranAt = new Date();
+        const durationMs = Date.now() - startTime;
+        
+        let timeZone = 'UTC';
+        try {
+            const config = await Config.findOne().lean();
+            if (config && config.defaultTimezone) {
+                timeZone = config.defaultTimezone;
+            }
+        } catch (configErr) {
+            console.error('[CRON SERVICE] Failed to load global timezone config in execute job:', configErr);
+        }
+
+        const nextRun = getNextCronRun(job.schedule, ranAt, timeZone);
+        await Cron.findByIdAndUpdate(job._id, {
+            lastRun: ranAt,
+            lastRunStatus: status,
+            lastRunLog: logOutput,
+            nextRun
+        });
+        await CronLog.create({
+            cronId: job._id,
+            cronName: job.name,
+            action: job.action,
+            status,
+            method: requestMethod,
+            url: requestUrlForLog || requestUrl,
+            log: logOutput,
+            durationMs,
+            ranAt
+        });
+        console.log(`[CRON SERVICE] Finished job: ${job.name} (${status})`);
+
+        // Send Notification if linked & enabled
+        if (job.notificationEnabled) {
+            const shouldNotify = 
+                job.notificationOn === 'always' ||
+                (job.notificationOn === 'success' && status === 'success') ||
+                (job.notificationOn === 'failure' && status === 'failure');
+                
+            if (shouldNotify) {
+                const emoji = status === 'success' ? '✅' : '❌';
+                const tag = status === 'success' ? 'white_check_mark,success' : 'x,failure';
+                sendNotification({
+                    title: `${emoji} Cron Job ${status.toUpperCase()}: ${job.name}`,
+                    message: `Task: ${job.name}\nStatus: ${status.toUpperCase()}\n\nLogs:\n${logOutput.slice(0, 1000)}`,
+                    priority: status === 'success' ? '3' : '4',
+                    tags: tag
+                }).catch(notifyErr => {
+                    console.error('[CRON SERVICE] Failed to dispatch cron notification:', notifyErr);
+                });
+            }
+        }
+    } catch (updateErr) {
+        console.error('[CRON SERVICE] Failed to update job run logs:', updateErr);
+    }
+}

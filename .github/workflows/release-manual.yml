@@ -1,0 +1,458 @@
+name: Release PR + Deploy After Merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Select release type (feat=minor, fix=patch, major=major)
+        required: true
+        type: choice
+        options:
+          - feat
+          - fix
+          - major
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  determine-release:
+    name: Determine Next Version
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      release_type: ${{ steps.bump.outputs.release_type }}
+      release_as: ${{ steps.bump.outputs.release_as }}
+      version: ${{ steps.bump.outputs.version }}
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Calculate next version from release type
+        id: bump
+        env:
+          RELEASE_TYPE: ${{ github.event.inputs.release_type }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+
+          release_type = os.environ.get("RELEASE_TYPE", "").strip().lower()
+          allowed_types = {"feat", "fix", "major"}
+          if release_type not in allowed_types:
+              raise SystemExit(
+                  "Invalid release_type. Allowed values: feat, fix, major."
+              )
+
+          with open("package.json", "r", encoding="utf-8") as f:
+              current_version = json.load(f).get("version", "").strip()
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+", current_version):
+              raise SystemExit(
+                  f"Invalid package.json version '{current_version}'. Expected X.Y.Z."
+              )
+
+          major, minor, patch = [int(part) for part in current_version.split(".")]
+
+          if release_type == "feat":
+              minor += 1
+              patch = 0
+          elif release_type == "fix":
+              patch += 1
+          else:
+              major += 1
+              minor = 0
+              patch = 0
+
+          release_as = f"{major}.{minor}.{patch}"
+          version = f"v{release_as}"
+
+          output_file = os.environ["GITHUB_OUTPUT"]
+          with open(output_file, "a", encoding="utf-8") as f:
+              f.write(f"release_type={release_type}\n")
+              f.write(f"release_as={release_as}\n")
+              f.write(f"version={version}\n")
+
+          print(f"Current version: {current_version}")
+          print(f"Release type: {release_type}")
+          print(f"Next version: {version}")
+          PY
+
+  create-release-pr:
+    name: Create or Update Release PR
+    if: github.event_name == 'workflow_dispatch'
+    needs: determine-release
+    runs-on: ubuntu-latest
+    outputs:
+      pull_request_number: ${{ steps.cpr.outputs.pull-request-number }}
+      pull_request_url: ${{ steps.cpr.outputs.pull-request-url }}
+      pull_request_operation: ${{ steps.cpr.outputs.pull-request-operation }}
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update release version files
+        env:
+          NEXT_VERSION: ${{ needs.determine-release.outputs.release_as }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from datetime import date
+          from pathlib import Path
+
+          next_version = os.environ["NEXT_VERSION"].strip()
+          repository = os.environ.get("GITHUB_REPOSITORY", "aiyu-ayaan/Aiyu").strip()
+
+          package_path = Path("package.json")
+          package_lock_path = Path("package-lock.json")
+          manifest_path = Path(".release-please-manifest.json")
+          changelog_path = Path("CHANGELOG.md")
+
+          def write_json(path: Path, data: dict) -> None:
+              path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+          package_data = json.loads(package_path.read_text(encoding="utf-8"))
+          current_version = package_data.get("version", "").strip()
+          if not current_version:
+              raise SystemExit("package.json version is missing.")
+
+          package_data["version"] = next_version
+          write_json(package_path, package_data)
+
+          lock_data = json.loads(package_lock_path.read_text(encoding="utf-8"))
+          lock_data["version"] = next_version
+          if isinstance(lock_data.get("packages"), dict) and isinstance(lock_data["packages"].get(""), dict):
+              lock_data["packages"][""]["version"] = next_version
+          write_json(package_lock_path, lock_data)
+
+          manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+          manifest_data["."] = next_version
+          write_json(manifest_path, manifest_data)
+
+          changelog_text = changelog_path.read_text(encoding="utf-8")
+          compare_url = f"https://github.com/{repository}/compare/v{current_version}...v{next_version}"
+          heading = f"## [{next_version}]({compare_url}) ({date.today().isoformat()})"
+          
+          if heading not in changelog_text:
+              # Extract commits between versions
+              commits_output = subprocess.check_output(
+                  ["git", "log", f"v{current_version}..HEAD", "--oneline", "--format=%s"],
+                  text=True,
+              ).strip()
+              
+              features = []
+              bug_fixes = []
+              breaking_changes = []
+              other_commits = []
+              
+              if commits_output:
+                  for commit_msg in commits_output.split('\n'):
+                      if not commit_msg:
+                          continue
+                      
+                      if commit_msg.startswith("feat"):
+                          features.append(commit_msg)
+                      elif commit_msg.startswith("fix"):
+                          bug_fixes.append(commit_msg)
+                      elif "BREAKING" in commit_msg.upper():
+                          breaking_changes.append(commit_msg)
+                      else:
+                          other_commits.append(commit_msg)
+              
+              # Build changelog entry
+              entry = f"{heading}\n\n"
+              
+              if breaking_changes:
+                  entry += "### ⚠ BREAKING CHANGES\n\n"
+                  for commit in breaking_changes:
+                      entry += f"* {commit}\n"
+                  entry += "\n"
+              
+              if features:
+                  entry += "### Features\n\n"
+                  for commit in features:
+                      entry += f"* {commit}\n"
+                  entry += "\n"
+              
+              if bug_fixes:
+                  entry += "### Bug Fixes\n\n"
+                  for commit in bug_fixes:
+                      entry += f"* {commit}\n"
+                  entry += "\n"
+              
+              if other_commits:
+                  entry += "### Other Changes\n\n"
+                  for commit in other_commits:
+                      entry += f"* {commit}\n"
+                  entry += "\n"
+              
+              if not commits_output:
+                  entry += "### Notes\n\n* Release {next_version}\n\n"
+              
+              marker = "# Changelog\n\n"
+              if marker in changelog_text:
+                  changelog_text = changelog_text.replace(marker, marker + entry, 1)
+              else:
+                  changelog_text = "# Changelog\n\n" + entry + changelog_text
+              changelog_path.write_text(changelog_text, encoding="utf-8")
+
+          print(f"Current version: {current_version}")
+          print(f"Next version: {next_version}")
+          PY
+
+      - name: Create or update release PR
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore(master): release v${{ needs.determine-release.outputs.release_as }}'
+          title: 'chore(master): release v${{ needs.determine-release.outputs.release_as }}'
+          body: |
+            This automated release PR updates the version based on selected release type.
+
+            - Release type: ${{ needs.determine-release.outputs.release_type }}
+            - Target version: v${{ needs.determine-release.outputs.release_as }}
+            - Updated files:
+              - package.json
+              - package-lock.json
+              - .release-please-manifest.json
+              - CHANGELOG.md
+
+            Deployment runs automatically after this PR is merged into master.
+          branch: chore/release-v${{ needs.determine-release.outputs.release_as }}
+          base: master
+          labels: release
+          delete-branch: true
+
+      - name: Ensure release PR was created or updated
+        if: steps.cpr.outputs.pull-request-number == ''
+        run: |
+          echo "No release PR was created or updated."
+          echo "Check if target version already exists or branch protection blocks PR creation."
+          exit 1
+
+      - name: Release PR summary
+        run: |
+          echo "Requested release type: ${{ needs.determine-release.outputs.release_type }}"
+          echo "Target version: ${{ needs.determine-release.outputs.version }}"
+          echo "pull_request_number=${{ steps.cpr.outputs.pull-request-number }}"
+          echo "pull_request_url=${{ steps.cpr.outputs.pull-request-url }}"
+          echo "pull_request_operation=${{ steps.cpr.outputs.pull-request-operation }}"
+          echo "Release PR includes version updates in package.json, package-lock.json, CHANGELOG.md, and .release-please-manifest.json."
+
+  detect-release-merge:
+    name: Detect Merged Release Commit
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.detect.outputs.should_deploy }}
+      version: ${{ steps.detect.outputs.version }}
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect if push is from merged release PR
+        id: detect
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          commit_message = os.environ.get("HEAD_COMMIT_MESSAGE", "").strip()
+          release_merge_match = re.match(
+              r"^\s*chore(?:\([^)]+\))?:\s*release\s+v?(\d+\.\d+\.\d+)\s*$",
+              commit_message,
+              flags=re.IGNORECASE,
+          )
+
+          changed_files_output = subprocess.check_output(
+              ["git", "show", "--name-only", "--pretty=", "HEAD"],
+              text=True,
+          )
+          changed_files = {
+              line.strip()
+              for line in changed_files_output.splitlines()
+              if line.strip()
+          }
+
+          release_files_match = (
+              ".release-please-manifest.json" in changed_files
+              and "package.json" in changed_files
+              and "package-lock.json" in changed_files
+          )
+
+          should_deploy = "true" if (release_merge_match or release_files_match) else "false"
+
+          if release_merge_match:
+              version = f"v{release_merge_match.group(1)}"
+          elif should_deploy == "true":
+              with open("package.json", "r", encoding="utf-8") as f:
+                  package_version = json.load(f).get("version", "").strip()
+              version = f"v{package_version}" if package_version else ""
+          else:
+              version = ""
+
+          output_file = os.environ["GITHUB_OUTPUT"]
+          with open(output_file, "a", encoding="utf-8") as f:
+              f.write(f"should_deploy={should_deploy}\n")
+              f.write(f"version={version}\n")
+
+          print(f"Commit message: {commit_message}")
+          print(f"Release files match: {release_files_match}")
+          print(f"should_deploy={should_deploy}")
+          if version:
+              print(f"version={version}")
+          PY
+
+      - name: Skip reason
+        if: steps.detect.outputs.should_deploy != 'true'
+        run: echo "Push is not from a merged release PR; deployment skipped."
+
+  push-to-docker-hub:
+    name: Push Docker image to Docker Hub
+    needs: detect-release-merge
+    if: github.event_name == 'push' && needs.detect-release-merge.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: get-version
+        run: |
+          VERSION="${{ needs.detect-release-merge.outputs.version }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Docker image will be tagged with: $VERSION"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: aiyuayaan/aiyu
+          tags: |
+            type=raw,value=${{ steps.get-version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: index.docker.io/aiyuayaan/aiyu
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  deploy:
+    name: Deploy to Server
+    needs: [detect-release-merge, push-to-docker-hub]
+    if: github.event_name == 'push' && needs.detect-release-merge.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: get-version
+        run: |
+          VERSION="${{ needs.detect-release-merge.outputs.version }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Deploying version: $VERSION"
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: |
+            set -e
+
+            echo "Starting deployment..."
+
+            echo "Navigating to project directory..."
+            cd docker/Aiyu/ || { echo "Failed to navigate to docker/Aiyu/"; exit 1; }
+
+            echo "Pulling latest Docker image..."
+            docker compose pull || { echo "Failed to pull latest image"; exit 1; }
+
+            echo "Restarting containers..."
+            sudo docker compose up -d || { echo "Failed to start containers"; exit 1; }
+
+            echo "Deployment completed successfully!"
+
+  create-release:
+    name: Create GitHub Release
+    needs: [detect-release-merge, push-to-docker-hub]
+    if: github.event_name == 'push' && needs.detect-release-merge.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: get-version
+        run: |
+          VERSION="${{ needs.detect-release-merge.outputs.version }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Creating release: $VERSION"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get-version.outputs.version }}
+          name: Release ${{ steps.get-version.outputs.version }}
+          generate_release_notes: true
+          body: |
+            **Docker Image:** `aiyuayaan/aiyu:${{ steps.get-version.outputs.version }}`
+
+            ### Deployment Status
+            - ✅ Docker image pushed to Docker Hub
+            - ✅ Server successfully deployed
+
+            ---
+          draft: false
+          prerelease: false

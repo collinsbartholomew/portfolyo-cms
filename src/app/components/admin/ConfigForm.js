@@ -1,0 +1,699 @@
+"use client";
+import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { Sparkles, Loader2 } from 'lucide-react';
+import Toast from './Toast';
+
+const ConfigForm = () => {
+    const router = useRouter();
+    const [formData, setFormData] = useState({
+        googleAnalyticsId: '',
+        logoText: '< aiyu />',
+        siteTitle: '',
+        ogImage: '',
+        favicon: {
+            value: '',
+            filename: '',
+            mimeType: ''
+        },
+        resume: {
+            type: 'url',
+            value: '',
+            filename: '',
+        },
+        projectsTitle: '',
+        projectsSubtitle: '',
+        blogsTitle: '',
+        blogsSubtitle: '',
+        galleryTitle: '',
+        gallerySubtitle: '',
+    });
+    const [loading, setLoading] = useState(true);
+    const [saving, setSaving] = useState(false);
+    const [error, setError] = useState('');
+    const [notification, setNotification] = useState(null);
+    const [aiEnabled, setAiEnabled] = useState(false);
+    const [aiGenerating, setAiGenerating] = useState(null); // 'projects', 'blogs', 'gallery'
+    const [uploadingOgImage, setUploadingOgImage] = useState(false);
+
+    useEffect(() => {
+        fetchData();
+        checkAiConfig();
+    }, []);
+
+    const checkAiConfig = async () => {
+        try {
+            const res = await fetch('/api/admin/ai/config');
+            const data = await res.json();
+            if (data.success && data.data) {
+                setAiEnabled(data.data.enabled);
+            }
+        } catch (error) {
+            console.error('Failed to fetch AI config:', error);
+        }
+    };
+
+    const handleAiAction = async (section) => {
+        if (aiGenerating) return;
+        setAiGenerating(section);
+
+        try {
+            const titleMap = {
+                projects: formData.projectsTitle,
+                blogs: formData.blogsTitle,
+                gallery: formData.galleryTitle
+            };
+
+            const res = await fetch('/api/admin/ai/text', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    mode: 'generate_subtitle',
+                    prompt: titleMap[section],
+                    context: { section }
+                })
+            });
+
+            const data = await res.json();
+
+            if (data.success) {
+                const key = `${section}Subtitle`;
+                setFormData(prev => ({ ...prev, [key]: data.data }));
+                showNotification(true, `${section.charAt(0).toUpperCase() + section.slice(1)} subtitle generated!`);
+            } else {
+                showNotification(false, data.error || 'AI synthesis failed');
+            }
+        } catch (error) {
+            console.error('AI Error:', error);
+            showNotification(false, 'AI uplink interrupted');
+        } finally {
+            setAiGenerating(null);
+        }
+    };
+
+    const fetchData = async () => {
+        try {
+            const res = await fetch('/api/config');
+            if (res.ok) {
+                const data = await res.json();
+                if (data) {
+                    setFormData({
+                        googleAnalyticsId: data.googleAnalyticsId || '',
+                        logoText: data.logoText || '< aiyu />',
+                        siteTitle: data.siteTitle || '',
+                        ogImage: data.ogImage || '',
+                        favicon: {
+                            value: data.favicon?.value || '',
+                            filename: data.favicon?.filename || '',
+                            mimeType: data.favicon?.mimeType || ''
+                        },
+                        resume: {
+                            type: data.resume?.type || 'url',
+                            value: data.resume?.value || '',
+                            filename: data.resume?.filename || '',
+                        },
+                        projectsTitle: data.projectsTitle || 'Projects Portfolio',
+                        projectsSubtitle: data.projectsSubtitle || 'A collection of my work',
+                        blogsTitle: data.blogsTitle || 'Latest Insights',
+                        blogsSubtitle: data.blogsSubtitle || 'Thoughts, tutorials, and updates on web development and technology.',
+                        galleryTitle: data.galleryTitle || 'Gallery',
+                        gallerySubtitle: data.gallerySubtitle || 'A visual journey through my lens.',
+                    });
+                }
+            }
+        } catch (err) {
+            console.error('Failed to fetch config', err);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleChange = (e) => {
+        const { name, value } = e.target;
+        setFormData((prev) => ({ ...prev, [name]: value }));
+    };
+
+    const showNotification = (success, message) => {
+        setNotification({ success, message });
+        setTimeout(() => setNotification(null), 3000);
+    };
+
+    // Resume Handlers
+    const handleResumeTypeChange = (type) => {
+        setFormData(prev => ({
+            ...prev,
+            resume: { ...prev.resume, type }
+        }));
+    };
+
+    const handleResumeValueChange = (value) => {
+        setFormData(prev => ({
+            ...prev,
+            resume: { ...prev.resume, value }
+        }));
+    };
+
+    const handleFileUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            if (file.size > 5 * 1024 * 1024) { // 5MB limit
+                setError("File size too large. Max 5MB.");
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setFormData(prev => ({
+                    ...prev,
+                    resume: {
+                        ...prev.resume,
+                        type: 'file',
+                        value: reader.result, // Base64 string
+                        filename: file.name
+                    }
+                }));
+            };
+            reader.readAsDataURL(file);
+        }
+    };
+
+    const handleFaviconUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            if (file.size > 1 * 1024 * 1024) { // 1MB limit for favicon
+                setError("Favicon size too large. Max 1MB.");
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setFormData(prev => ({
+                    ...prev,
+                    favicon: {
+                        value: reader.result,
+                        filename: file.name,
+                        mimeType: file.type
+                    }
+                }));
+            };
+            reader.readAsDataURL(file);
+        }
+    };
+
+    const handleOgImageUpload = async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setUploadingOgImage(true);
+        setError('');
+
+        try {
+            const payload = new FormData();
+            payload.append('file', file);
+
+            const response = await fetch('/api/upload', {
+                method: 'POST',
+                body: payload,
+            });
+
+            const data = await response.json();
+
+            if (!response.ok || !data.success) {
+                throw new Error(data.error || 'Failed to upload OG image');
+            }
+
+            setFormData((prev) => ({
+                ...prev,
+                ogImage: data.url,
+            }));
+            showNotification(true, 'OG image uploaded and preview updated.');
+        } catch (err) {
+            const message = err instanceof Error ? err.message : 'Failed to upload OG image';
+            setError(message);
+            showNotification(false, message);
+        } finally {
+            setUploadingOgImage(false);
+            e.target.value = '';
+        }
+    };
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setSaving(true);
+        setError('');
+
+        try {
+            const response = await fetch('/api/config', {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(formData),
+            });
+
+            if (response.ok) {
+                showNotification(true, 'System Configuration Updated Successfully');
+                router.refresh();
+                fetchData(); // Refresh data
+            } else {
+                const data = await response.json();
+                setError(data.error || 'Something went wrong');
+                showNotification(false, data.error || 'Failed to update');
+            }
+        } catch {
+            setError('An error occurred');
+            showNotification(false, 'An error occurred');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    if (loading) return <div className="text-cyan-400 font-mono animate-pulse">LOADING_SYSTEM_CONFIG...</div>;
+
+    return (
+        <form onSubmit={handleSubmit} className="space-y-12 max-w-4xl mx-auto">
+            {error && (
+                <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-lg flex items-center gap-3">
+                    <span className="text-xl">⚠️</span>
+                    {error}
+                </div>
+            )}
+
+            {/* Branding Section */}
+            <div className="bg-slate-900/50 backdrop-blur-xl rounded-2xl border border-white/10 p-4 md:p-8 relative overflow-hidden group">
+                <div className="absolute top-0 right-0 w-64 h-64 bg-cyan-500/5 rounded-full blur-[100px] pointer-events-none transition-opacity opacity-50 group-hover:opacity-100" />
+
+                <h2 className="text-sm font-mono text-cyan-500/70 uppercase tracking-widest mb-8 flex items-center gap-4">
+                    Identity Matrix
+                    <div className="h-px bg-cyan-500/10 flex-grow" />
+                </h2>
+
+                <div className="space-y-6 relative z-10">
+                    <div>
+                        <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Logo Identifier</label>
+                        <input
+                            type="text"
+                            name="logoText"
+                            value={formData.logoText}
+                            onChange={handleChange}
+                            placeholder="< aiyu />"
+                            className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-cyan-400 font-mono focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/50 outline-none transition-all placeholder:text-slate-700"
+                        />
+                        <p className="text-xs text-slate-500 mt-2 font-mono">
+                            {'// Displayed in the top-left of the navigation header.'}
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+
+
+            {/* Browser & SEO Section */}
+            <div className="bg-slate-900/50 backdrop-blur-xl rounded-2xl border border-white/10 p-4 md:p-8 relative overflow-hidden group">
+                <div className="absolute top-0 right-0 w-64 h-64 bg-green-500/5 rounded-full blur-[100px] pointer-events-none transition-opacity opacity-50 group-hover:opacity-100" />
+
+                <h2 className="text-sm font-mono text-green-500/70 uppercase tracking-widest mb-8 flex items-center gap-4">
+                    SEO & Metadata
+                    <div className="h-px bg-green-500/10 flex-grow" />
+                </h2>
+
+                <div className="space-y-6 relative z-10">
+                    <div>
+                        <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Site Title</label>
+                        <input
+                            type="text"
+                            name="siteTitle"
+                            value={formData.siteTitle}
+                            onChange={handleChange}
+                            placeholder="Ayaan's Portfolio"
+                            className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-green-500/50 focus:ring-1 focus:ring-green-500/50 outline-none transition-all placeholder:text-slate-600"
+                        />
+                        <p className="text-xs text-slate-500 mt-2 font-mono">
+                            {'// The title shown in the browser tab.'}
+                        </p>
+                    </div>
+                    <div>
+                        <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Favicon Source</label>
+                        <div className="flex items-center gap-4">
+                            <label className="cursor-pointer bg-slate-950/50 border border-white/10 hover:border-green-500/50 text-slate-300 px-4 py-3 rounded-lg transition-all flex items-center gap-3 w-full">
+                                <span className="bg-green-500/10 text-green-400 px-2 py-1 rounded text-xs font-bold uppercase">Upload</span>
+                                <span className="text-sm truncate opacity-60 hover:opacity-100 transition-opacity">
+                                    {formData.favicon.filename || "Select .ico, .png, .svg..."}
+                                </span>
+                                <input
+                                    type="file"
+                                    accept=".ico,.png,.jpg,.svg"
+                                    onChange={handleFaviconUpload}
+                                    className="hidden"
+                                />
+                            </label>
+                            {formData.favicon.value && (
+                                <div className="h-12 w-12 rounded-lg bg-slate-950/50 border border-white/10 flex items-center justify-center p-2 shrink-0">
+                                    <img src={formData.favicon.value} alt="Favicon Preview" className="w-full h-full object-contain" loading="lazy" decoding="async" />
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                    <div>
+                        <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Open Graph Image</label>
+                        <div className="space-y-3">
+                            <input
+                                type="text"
+                                name="ogImage"
+                                value={formData.ogImage}
+                                onChange={handleChange}
+                                placeholder="/api/uploads/your-og-image.webp or https://example.com/og-image.png"
+                                className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-green-500/50 focus:ring-1 focus:ring-green-500/50 outline-none transition-all placeholder:text-slate-600 font-mono text-sm"
+                            />
+                            <div className="flex flex-col gap-4 md:flex-row md:items-center">
+                                <label className={`cursor-pointer bg-slate-950/50 border border-white/10 hover:border-green-500/50 text-slate-300 px-4 py-3 rounded-lg transition-all flex items-center gap-3 ${uploadingOgImage ? 'opacity-60 pointer-events-none' : ''}`}>
+                                    <span className="bg-green-500/10 text-green-400 px-2 py-1 rounded text-xs font-bold uppercase">
+                                        {uploadingOgImage ? 'Uploading' : 'Upload'}
+                                    </span>
+                                    <span className="text-sm opacity-70">Select OG image</span>
+                                    <input
+                                        type="file"
+                                        accept="image/*"
+                                        onChange={handleOgImageUpload}
+                                        className="hidden"
+                                    />
+                                </label>
+                                <p className="text-xs text-slate-500 font-mono">
+                                    {'// Preview updates instantly here. Public metadata updates after save.'}
+                                </p>
+                            </div>
+                            {formData.ogImage && (
+                                <div className="overflow-hidden rounded-xl border border-white/10 bg-slate-950/50">
+                                    <img
+                                        src={formData.ogImage}
+                                        alt="OG Image Preview"
+                                        className="w-full max-h-64 object-cover"
+                                        loading="lazy"
+                                        decoding="async"
+                                    />
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Page Headers Section */}
+            <div className="bg-slate-900/50 backdrop-blur-xl rounded-2xl border border-white/10 p-4 md:p-8 relative overflow-hidden group">
+                <div className="absolute top-0 right-0 w-64 h-64 bg-orange-500/5 rounded-full blur-[100px] pointer-events-none transition-opacity opacity-50 group-hover:opacity-100" />
+
+                <h2 className="text-sm font-mono text-orange-500/70 uppercase tracking-widest mb-8 flex items-center gap-4">
+                    Route Headers
+                    <div className="h-px bg-orange-500/10 flex-grow" />
+                </h2>
+
+                <div className="space-y-6 relative z-10">
+                    {/* Projects Header */}
+                    <div className="p-6 rounded-xl bg-white/[0.02] border border-white/10 hover:border-orange-500/20 transition-colors">
+                        <h3 className="text-xs font-bold text-orange-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                            <span className="w-1 h-4 bg-orange-500 rounded-full" /> /projects
+                        </h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Title</label>
+                                <input
+                                    type="text"
+                                    name="projectsTitle"
+                                    value={formData.projectsTitle}
+                                    onChange={handleChange}
+                                    className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 outline-none transition-all placeholder:text-slate-600/50"
+                                />
+                            </div>
+                            <div>
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-slate-400 text-xs font-mono uppercase tracking-wider">Subtitle</label>
+                                    {aiEnabled && (
+                                        <button
+                                            type="button"
+                                            onClick={() => handleAiAction('projects')}
+                                            disabled={aiGenerating === 'projects' || !formData.projectsTitle}
+                                            className="flex items-center gap-1 px-2 py-0.5 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 rounded border border-orange-500/20 transition-all text-[9px] font-bold uppercase tracking-wider disabled:opacity-50 disabled:cursor-not-allowed group/ai"
+                                        >
+                                            {aiGenerating === 'projects' ? (
+                                                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                            ) : (
+                                                <Sparkles className="w-2.5 h-2.5 group-hover/ai:rotate-12 transition-transform" />
+                                            )}
+                                            AI Suggest
+                                        </button>
+                                    )}
+                                </div>
+                                <input
+                                    type="text"
+                                    name="projectsSubtitle"
+                                    value={formData.projectsSubtitle}
+                                    onChange={handleChange}
+                                    className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 outline-none transition-all placeholder:text-slate-600/50"
+                                />
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Blogs Header */}
+                    <div className="p-6 rounded-xl bg-white/[0.02] border border-white/10 hover:border-orange-500/20 transition-colors">
+                        <h3 className="text-xs font-bold text-orange-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                            <span className="w-1 h-4 bg-orange-500 rounded-full" /> /blogs
+                        </h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Title</label>
+                                <input
+                                    type="text"
+                                    name="blogsTitle"
+                                    value={formData.blogsTitle}
+                                    onChange={handleChange}
+                                    className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 outline-none transition-all placeholder:text-slate-600/50"
+                                />
+                            </div>
+                            <div>
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-slate-400 text-xs font-mono uppercase tracking-wider">Subtitle</label>
+                                    {aiEnabled && (
+                                        <button
+                                            type="button"
+                                            onClick={() => handleAiAction('blogs')}
+                                            disabled={aiGenerating === 'blogs' || !formData.blogsTitle}
+                                            className="flex items-center gap-1 px-2 py-0.5 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 rounded border border-orange-500/20 transition-all text-[9px] font-bold uppercase tracking-wider disabled:opacity-50 disabled:cursor-not-allowed group/ai"
+                                        >
+                                            {aiGenerating === 'blogs' ? (
+                                                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                            ) : (
+                                                <Sparkles className="w-2.5 h-2.5 group-hover/ai:rotate-12 transition-transform" />
+                                            )}
+                                            AI Suggest
+                                        </button>
+                                    )}
+                                </div>
+                                <textarea
+                                    name="blogsSubtitle"
+                                    value={formData.blogsSubtitle}
+                                    onChange={handleChange}
+                                    rows="1"
+                                    className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 outline-none transition-all placeholder:text-slate-600/50 resize-none"
+                                />
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Gallery Header */}
+                    <div className="p-6 rounded-xl bg-white/[0.02] border border-white/10 hover:border-orange-500/20 transition-colors">
+                        <h3 className="text-xs font-bold text-orange-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                            <span className="w-1 h-4 bg-orange-500 rounded-full" /> /gallery
+                        </h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Title</label>
+                                <input
+                                    type="text"
+                                    name="galleryTitle"
+                                    value={formData.galleryTitle}
+                                    onChange={handleChange}
+                                    className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 outline-none transition-all placeholder:text-slate-600/50"
+                                />
+                            </div>
+                            <div>
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-slate-400 text-xs font-mono uppercase tracking-wider">Subtitle</label>
+                                    {aiEnabled && (
+                                        <button
+                                            type="button"
+                                            onClick={() => handleAiAction('gallery')}
+                                            disabled={aiGenerating === 'gallery' || !formData.galleryTitle}
+                                            className="flex items-center gap-1 px-2 py-0.5 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 rounded border border-orange-500/20 transition-all text-[9px] font-bold uppercase tracking-wider disabled:opacity-50 disabled:cursor-not-allowed group/ai"
+                                        >
+                                            {aiGenerating === 'gallery' ? (
+                                                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                            ) : (
+                                                <Sparkles className="w-2.5 h-2.5 group-hover/ai:rotate-12 transition-transform" />
+                                            )}
+                                            AI Suggest
+                                        </button>
+                                    )}
+                                </div>
+                                <input
+                                    type="text"
+                                    name="gallerySubtitle"
+                                    value={formData.gallerySubtitle}
+                                    onChange={handleChange}
+                                    className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 outline-none transition-all placeholder:text-slate-600/50"
+                                />
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Integrations Section */}
+            <div className="bg-slate-900/50 backdrop-blur-xl rounded-2xl border border-white/10 p-4 md:p-8 relative overflow-hidden group">
+                <div className="absolute top-0 right-0 w-64 h-64 bg-yellow-500/5 rounded-full blur-[100px] pointer-events-none transition-opacity opacity-50 group-hover:opacity-100" />
+
+                <h2 className="text-sm font-mono text-yellow-500/70 uppercase tracking-widest mb-8 flex items-center gap-4">
+                    External Integrations
+                    <div className="h-px bg-yellow-500/10 flex-grow" />
+                </h2>
+
+                <div className="space-y-6 relative z-10">
+                    <div>
+                        <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Google Analytics Measurement ID</label>
+                        <input
+                            type="text"
+                            name="googleAnalyticsId"
+                            value={formData.googleAnalyticsId}
+                            onChange={handleChange}
+                            placeholder="G-XXXXXXXXXX"
+                            className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-yellow-500/50 focus:ring-1 focus:ring-yellow-500/50 outline-none transition-all placeholder:text-slate-600"
+                        />
+                        <p className="text-xs text-slate-500 mt-2 font-mono">
+                            {'// Starts with G-'}
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            {/* Resume Section */}
+            <div className="bg-slate-900/50 backdrop-blur-xl rounded-2xl border border-white/10 p-4 md:p-8 relative overflow-hidden group">
+                <div className="absolute top-0 right-0 w-64 h-64 bg-blue-500/5 rounded-full blur-[100px] pointer-events-none transition-opacity opacity-50 group-hover:opacity-100" />
+
+                <h2 className="text-sm font-mono text-blue-500/70 uppercase tracking-widest mb-8 flex items-center gap-4">
+                    Resume / CV
+                    <div className="h-px bg-blue-500/10 flex-grow" />
+                </h2>
+
+                <div className="flex flex-col md:flex-row gap-4 mb-8">
+                    <label className={`flex items-center gap-3 cursor-pointer p-4 rounded-xl border transition-all w-full
+                        ${formData.resume.type === 'url' ? 'bg-blue-500/10 border-blue-500/40 text-blue-300' : 'bg-slate-950/50 border-white/10 text-slate-400'}
+                    `}>
+                        <div className={`w-4 h-4 rounded-full border flex items-center justify-center
+                             ${formData.resume.type === 'url' ? 'border-blue-400' : 'border-slate-600'}
+                        `}>
+                            {formData.resume.type === 'url' && <div className="w-2 h-2 rounded-full bg-blue-400" />}
+                        </div>
+                        <input
+                            type="radio"
+                            name="resumeType"
+                            checked={formData.resume.type === 'url'}
+                            onChange={() => handleResumeTypeChange('url')}
+                            className="hidden"
+                        />
+                        <span className="font-mono text-xs uppercase tracking-wider font-bold">External URL Link</span>
+                    </label>
+
+                    <label className={`flex items-center gap-3 cursor-pointer p-4 rounded-xl border transition-all w-full
+                        ${formData.resume.type === 'file' ? 'bg-blue-500/10 border-blue-500/40 text-blue-300' : 'bg-slate-950/50 border-white/10 text-slate-400'}
+                    `}>
+                        <div className={`w-4 h-4 rounded-full border flex items-center justify-center
+                             ${formData.resume.type === 'file' ? 'border-blue-400' : 'border-slate-600'}
+                        `}>
+                            {formData.resume.type === 'file' && <div className="w-2 h-2 rounded-full bg-blue-400" />}
+                        </div>
+                        <input
+                            type="radio"
+                            name="resumeType"
+                            checked={formData.resume.type === 'file'}
+                            onChange={() => handleResumeTypeChange('file')}
+                            className="hidden"
+                        />
+                        <span className="font-mono text-xs uppercase tracking-wider font-bold">Direct File Upload</span>
+                    </label>
+                </div>
+
+                {formData.resume.type === 'url' ? (
+                    <div>
+                        <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Resume URL Asset</label>
+                        <input
+                            type="url"
+                            value={formData.resume.value}
+                            onChange={(e) => handleResumeValueChange(e.target.value)}
+                            placeholder="https://example.com/my-resume.pdf"
+                            className="w-full bg-slate-950/50 border border-white/10 rounded-lg p-3 text-slate-200 focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/50 outline-none transition-all placeholder:text-slate-700 font-mono"
+                        />
+                    </div>
+                ) : (
+                    <div>
+                        <label className="block text-slate-400 mb-2 text-xs font-mono uppercase tracking-wider">Upload PDF Asset</label>
+                        <div className="flex items-center gap-4">
+                            <label className="cursor-pointer bg-slate-950/50 border border-white/10 hover:border-blue-500/50 text-slate-300 px-4 py-3 rounded-lg transition-all flex items-center gap-3 w-full">
+                                <span className="bg-blue-500/10 text-blue-400 px-2 py-1 rounded text-xs font-bold uppercase">Choose File</span>
+                                <span className="text-sm truncate opacity-60 hover:opacity-100 transition-opacity">
+                                    {formData.resume.filename || "Select PDF document..."}
+                                </span>
+                                <input
+                                    type="file"
+                                    accept=".pdf,.doc,.docx"
+                                    onChange={handleFileUpload}
+                                    className="hidden"
+                                />
+                            </label>
+                            {formData.resume.value && formData.resume.type === 'file' && formData.resume.value.startsWith('data:') && (
+                                <a href={formData.resume.value} download={formData.resume.filename || 'resume.pdf'} className="flex items-center gap-2 px-4 py-2 bg-[#0a0a0a] border border-white/10 rounded-lg text-xs text-blue-400 hover:text-blue-300 hover:border-blue-500/30 transition-all uppercase tracking-wider font-bold whitespace-nowrap">
+                                    Download Existing
+                                </a>
+                            )}
+                        </div>
+                        {formData.resume.filename && (
+                            <div className="mt-3 text-xs text-blue-400 flex items-center gap-1 font-mono">
+                                <span>[SECURE] Asset ready for upload:</span>
+                                <span>{formData.resume.filename}</span>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            {/* Sticky Action Footer */}
+            <div className="sticky bottom-8 flex justify-end gap-4 pt-6 border-t border-white/5 bg-slate-900/90 backdrop-blur-lg p-4 rounded-xl border border-white/5 shadow-2xl z-50 mt-12">
+                <button
+                    type="button"
+                    onClick={() => router.back()}
+                    className="px-6 py-2 rounded bg-white/5 hover:bg-white/10 text-slate-400 transition-colors text-sm font-medium"
+                >
+                    CANCEL
+                </button>
+                <button
+                    type="submit"
+                    disabled={saving}
+                    className="px-8 py-2 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-bold transition-all shadow-[0_0_20px_rgba(8,145,178,0.3)] hover:shadow-[0_0_30px_rgba(8,145,178,0.5)] disabled:opacity-50 disabled:cursor-not-allowed text-sm tracking-wide flex items-center gap-2"
+                >
+                    {saving ? (
+                        <>
+                            <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                            UPDATING_SYSTEM...
+                        </>
+                    ) : (
+                        'CONFIRM_UPDATE'
+                    )}
+                </button>
+            </div>
+
+            {/* Toast Notification */}
+            <Toast notification={notification} />
+        </form>
+    );
+};
+
+export default ConfigForm;

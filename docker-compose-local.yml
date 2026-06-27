@@ -1,0 +1,148 @@
+services:
+  # MongoDB Database Service
+  mongodb:
+    image: mongo:7
+    container_name: aiyu-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    # Port mapping commented out for security - app can access via internal network
+    # Uncomment if external MongoDB access is needed: 
+    # ports:
+    #   - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    networks:
+      - aiyu-network
+    mem_limit: ${MONGO_MEMORY_LIMIT:-512m}
+    mem_reservation: ${MONGO_MEMORY_RESERVATION:-256m}
+    cpus: ${MONGO_CPUS:-0.5}
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet" ]
+      interval: 60s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Next.js Application Service
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Only pass public variables as build args
+        # MONGODB_URI uses dummy value in Dockerfile to prevent credentials in image layers
+        # All sensitive credentials are provided at runtime via environment section below
+        - NEXT_PUBLIC_N8N_WEBHOOK_URL=${NEXT_PUBLIC_N8N_WEBHOOK_URL}
+        - NEXT_PUBLIC_BASE_URL=${NEXT_PUBLIC_BASE_URL}
+        - NEXT_PUBLIC_AUTHOR_NAME=${NEXT_PUBLIC_AUTHOR_NAME}
+    container_name: aiyu-app
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      # MongoDB connection
+      MONGODB_URI: ${MONGODB_URI}
+      # N8N webhook URL
+      NEXT_PUBLIC_N8N_WEBHOOK_URL: ${NEXT_PUBLIC_N8N_WEBHOOK_URL}
+      # Base URL for SEO/OG tags
+      NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL}
+      NEXT_PUBLIC_AUTHOR_NAME: ${NEXT_PUBLIC_AUTHOR_NAME}
+
+      # Admin credentials
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+
+      # Node environment
+      NODE_ENV: production
+      NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=256}
+    volumes:
+      # Persistent uploads directory (named volume for proper permissions)
+      - uploads_data:/app/public/uploads
+      # Writable Next.js cache directory (volume for read-only filesystem)
+      - nextjs_cache:/app/.next/cache
+    tmpfs:
+      # CRITICAL SECURITY: Mount /tmp with noexec to prevent crypto miners from executing
+      - /tmp:noexec,nosuid,nodev,mode=1777,size=100M
+      # Additional tmpfs mounts with noexec and nosuid for security
+      - /var/tmp:noexec,nosuid,nodev,mode=1777,size=50M
+      # /run uses 755 (not 1777) - only owner (nextjs user) needs write access for PID files
+      - /run:noexec,nosuid,nodev,mode=755,size=10M
+    # CRITICAL SECURITY: Drop all capabilities and enable security restrictions
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE # Only allow binding to network ports
+    security_opt:
+      - no-new-privileges:true # Prevent privilege escalation
+    # Read-only root filesystem (except for writable volumes)
+    read_only: true
+    mem_limit: ${APP_MEMORY_LIMIT:-384m}
+    mem_reservation: ${APP_MEMORY_RESERVATION:-192m}
+    cpus: ${APP_CPUS:-1.0}
+    # Resource limits to prevent CPU abuse from crypto miners
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0' # Max 1 CPU core
+          memory: 384M # Max 384MB RAM
+        reservations:
+          cpus: '0.25' # Reserve 0.25 CPU
+          memory: 192M # Reserve 192MB RAM
+    # Health check to detect abnormal behavior
+    # Uses curl (installed in Dockerfile) with fallback chain
+    healthcheck:
+      test: [ "CMD", "sh", "/app/healthcheck.sh" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+    networks:
+      - aiyu-network
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./public:/srv/public:ro
+      - uploads_data:/srv/uploads:ro
+      - nginx_cache:/var/cache/nginx
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - aiyu-network
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/nginx-health || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# Named volumes for data persistence
+volumes:
+  mongodb_data:
+    driver: local
+  mongodb_config:
+    driver: local
+  nextjs_cache:
+    driver: local
+  uploads_data:
+    driver: local
+  nginx_cache:
+    driver: local
+
+# Network for inter-service communication
+networks:
+  aiyu-network:
+    driver: bridge

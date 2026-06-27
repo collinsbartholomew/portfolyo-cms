@@ -1,0 +1,153 @@
+"use client";
+import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import Toast from './Toast';
+
+const SocialForm = ({ initialData, isEdit = false }) => {
+    const router = useRouter();
+    const [formData, setFormData] = useState({
+        name: '',
+        url: '',
+        iconName: '',
+        isHidden: false,
+    });
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+    const [notification, setNotification] = useState(null);
+
+    useEffect(() => {
+        if (initialData) {
+            setFormData(initialData);
+        }
+    }, [initialData]);
+
+    const handleChange = (e) => {
+        const { name, value } = e.target;
+        setFormData((prev) => ({ ...prev, [name]: value }));
+    };
+
+    const showNotification = (success, message) => {
+        setNotification({ success, message });
+        setTimeout(() => setNotification(null), 3000);
+    };
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        setError('');
+
+        try {
+            const url = isEdit ? `/api/socials/${initialData._id}` : '/api/socials';
+            const method = isEdit ? 'PUT' : 'POST';
+
+            const response = await fetch(url, {
+                method,
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(formData),
+            });
+
+            if (response.ok) {
+                showNotification(true, isEdit ? 'Social Link Updated Successfully' : 'Social Link Created Successfully');
+                setTimeout(() => {
+                    router.push('/admin/footer');
+                    router.refresh();
+                }, 1500);
+            } else {
+                const data = await response.json();
+                setError(data.error || 'Something went wrong');
+                showNotification(false, data.error || 'Failed to save');
+            }
+        } catch (err) {
+            setError('An error occurred');
+            showNotification(false, 'An error occurred');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <form onSubmit={handleSubmit} className="space-y-6 max-w-2xl mx-auto bg-slate-900/50 p-4 md:p-8 rounded-xl border border-white/10 backdrop-blur-xl">
+            {error && (
+                <div className="bg-red-500/10 border border-red-500/20 text-red-300 p-3 rounded font-mono text-sm">
+                    {error}
+                </div>
+            )}
+
+            <div>
+                <label className="block text-xs font-mono uppercase tracking-wider mb-2 text-slate-400">Name</label>
+                <input
+                    type="text"
+                    name="name"
+                    value={formData.name}
+                    onChange={handleChange}
+                    className="w-full p-3 rounded-lg bg-slate-950/50 border border-white/10 focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/50 outline-none text-white transition-all placeholder:text-slate-600"
+                    required
+                />
+            </div>
+
+            <div>
+                <label className="block text-xs font-mono uppercase tracking-wider mb-2 text-slate-400">URL</label>
+                <input
+                    type="url"
+                    name="url"
+                    value={formData.url}
+                    onChange={handleChange}
+                    className="w-full p-3 rounded-lg bg-slate-950/50 border border-white/10 focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/50 outline-none text-white transition-all placeholder:text-slate-600"
+                    required
+                />
+            </div>
+
+            <div>
+                <label className="block text-xs font-mono uppercase tracking-wider mb-2 text-slate-400">Icon Name (e.g., FaGithub)</label>
+                <input
+                    type="text"
+                    name="iconName"
+                    value={formData.iconName}
+                    onChange={handleChange}
+                    className="w-full p-3 rounded-lg bg-slate-950/50 border border-white/10 focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/50 outline-none text-white transition-all placeholder:text-slate-600"
+                    required
+                />
+                <p className="text-[10px] text-slate-500 mt-1 font-mono">Must match an icon exported in src/lib/icons.js</p>
+            </div>
+
+            <div className="flex items-center gap-3 p-3 bg-white/5 rounded-lg border border-white/5">
+                <input
+                    type="checkbox"
+                    id="isHidden"
+                    name="isHidden"
+                    checked={formData.isHidden || false}
+                    onChange={(e) => setFormData(prev => ({ ...prev, isHidden: e.target.checked }))}
+                    className="w-5 h-5 rounded border-white/10 bg-slate-950/50 text-cyan-600 focus:ring-cyan-500 focus:ring-offset-0 focus:ring-offset-transparent cursor-pointer accent-cyan-500"
+                />
+                <label htmlFor="isHidden" className="text-sm font-medium text-slate-300 cursor-pointer">
+                    Hide this social link
+                </label>
+            </div>
+
+            {/* Sticky Action Footer */}
+            <div className="sticky bottom-8 flex justify-end gap-4 pt-6 border-t border-white/5 bg-slate-900/90 backdrop-blur-lg p-4 rounded-xl border border-white/5 shadow-2xl z-50 mt-12">
+                <button
+                    type="button"
+                    onClick={() => router.back()}
+                    className="px-6 py-2 rounded bg-white/5 hover:bg-white/10 text-slate-400 transition-colors text-sm font-medium"
+                >
+                    CANCEL
+                </button>
+                <button
+                    type="submit"
+                    disabled={loading}
+                    className="px-8 py-2 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-bold transition-all shadow-[0_0_20px_rgba(8,145,178,0.3)] hover:shadow-[0_0_30px_rgba(8,145,178,0.5)] disabled:opacity-50 disabled:cursor-not-allowed text-sm tracking-wide uppercase"
+                >
+                    {loading ? 'UPDATING_SYSTEM...' : isEdit ? 'CONFIRM_UPDATE' : 'INITIALIZE_SOCIAL'}
+                </button>
+            </div>
+
+            {/* Toast Notification */}
+            <Toast notification={notification} />
+        </form>
+    );
+};
+
+export default SocialForm;
