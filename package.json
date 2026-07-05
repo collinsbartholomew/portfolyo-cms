@@ -71,5 +71,8 @@
     "tailwindcss": "^4",
     "playwright": "^1.61.1"
   },
-  "packageManager": "pnpm@11.3.0"
+  "packageManager": "pnpm@11.3.0",
+  "pnpm": {
+    "dangerouslyAllowAllBuilds": true
+  }
 }
