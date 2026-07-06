@@ -16,7 +16,7 @@ import Theme from "@/models/Theme";
 import Cron from "@/models/Cron";
 import Ads from "@/models/Ads";
 import NotificationConfig from "@/models/NotificationConfig";
-import archiver from "archiver";
+import * as archiver from "archiver";
 import { join } from "path";
 import { readFile, access, readdir } from "fs/promises";
 
